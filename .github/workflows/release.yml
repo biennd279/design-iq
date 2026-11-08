@@ -38,7 +38,7 @@ jobs:
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
-          images: ghcr.io/miragon/designiq-live-host
+          images: ghcr.io/${{ github.repository_owner }}/designiq-live-host
           tags: |
             type=sha,format=long,prefix=sha-
             type=raw,value=edge,enable={{is_default_branch}}
