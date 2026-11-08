@@ -28,6 +28,7 @@ import { loadPrivateKey } from "@designiq/github-app";
 import { Server } from "@hocuspocus/server";
 import * as Y from "yjs";
 
+import { createGiteaProvider, createGiteaSource, type GiteaConfig } from "./adapters/gitea/index.ts";
 import type { AppCredentials } from "./adapters/github/app-auth.ts";
 import { createGitHubAppSource } from "./adapters/github/app-source.ts";
 import { createGitHubIssueTracker } from "./adapters/github/issues.ts";
@@ -200,22 +201,44 @@ if (MINT_URL && TENANT_INSTALLATION_ID === undefined) {
 
 // PLATFORM-credentialed provider seam: where connected repos come from.
 // GitHub = App installations; a GitLab source will be an OAuth application +
-// explicit project selection behind the same interface.
-const connectionSource = tokens
-  ? createGitHubAppSource({
-      apiUrl: GH_API,
-      tokens,
-      // app-JWT creds only in LOCAL mode; a remote-minting cell holds no key
-      creds: MINT_URL ? undefined : appCreds,
-      appSlug,
-      // LOCAL: verify GitHub webhooks with the App secret. REMOTE cell: the
-      // control plane forwards events re-signed with the cell's own secret, so
-      // verify with CELL_SECRET (the cell never learns the App webhook secret).
-      webhookSecret: MINT_URL ? CELL_SECRET : WEBHOOK_SECRET,
-      baseUrl: GH_BASE,
-      tenantInstallationId: TENANT_INSTALLATION_ID,
-    })
-  : undefined;
+// explicit project selection behind the same interface. Gitea = a platform PAT
+// + org membership (docs/extending/connectors.md) — GITEA_URL/GITEA_TOKEN
+// select it, GITEA_ORGS scopes the connected set (empty = the token owner's
+// own repos), GITEA_WEBHOOK_SECRET verifies Gitea's HMAC webhooks.
+const GITEA_URL_ENV = process.env.GITEA_URL;
+const GITEA_TOKEN = process.env.GITEA_TOKEN;
+if (Boolean(GITEA_URL_ENV) !== Boolean(GITEA_TOKEN)) {
+  throw new Error("GITEA_URL and GITEA_TOKEN must be set together (docs/extending/connectors.md)");
+}
+const giteaCfg: GiteaConfig | undefined =
+  GITEA_URL_ENV && GITEA_TOKEN
+    ? {
+        baseUrl: GITEA_URL_ENV,
+        token: GITEA_TOKEN,
+        orgs: (process.env.GITEA_ORGS ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        webhookSecret: process.env.GITEA_WEBHOOK_SECRET,
+      }
+    : undefined;
+const connectionSource = giteaCfg
+  ? createGiteaSource(giteaCfg)
+  : tokens
+    ? createGitHubAppSource({
+        apiUrl: GH_API,
+        tokens,
+        // app-JWT creds only in LOCAL mode; a remote-minting cell holds no key
+        creds: MINT_URL ? undefined : appCreds,
+        appSlug,
+        // LOCAL: verify GitHub webhooks with the App secret. REMOTE cell: the
+        // control plane forwards events re-signed with the cell's own secret, so
+        // verify with CELL_SECRET (the cell never learns the App webhook secret).
+        webhookSecret: MINT_URL ? CELL_SECRET : WEBHOOK_SECRET,
+        baseUrl: GH_BASE,
+        tenantInstallationId: TENANT_INSTALLATION_ID,
+      })
+    : undefined;
 // the static fallback repo (GITHUB_REPO) is a single-tenant/local-dev convenience;
 // in a cell the connected set is defined solely by the tenant's installation
 const registry = new RepoRegistry(db, connectionSource, TENANT_INSTALLATION_ID ? undefined : HOST_REPO);
@@ -224,7 +247,7 @@ const workspaces = new WorkspaceManager({
   hostRepo: HOST_REPO,
   hostRoot: HOST_CONTENT,
   registry,
-  githubBaseUrl: GH_BASE,
+  githubBaseUrl: giteaCfg?.baseUrl ?? GH_BASE,
 });
 // when each repository last changed — the start page's "Updated X ago" (#213):
 // live edits arrive through the collab hooks, default-branch moves through the
@@ -287,8 +310,9 @@ if (process.env.LIVE_DEV_TOKEN) {
 }
 const local = NO_AUTH ? makeLocalPrincipal(process.env.LIVE_LOCAL_USER) : undefined;
 
-// the release backend (push URL + PR creation on installation tokens passed per call)
-const github = createGitHubProvider({ baseUrl: GH_BASE, apiUrl: GH_API });
+// the release backend (push URL + PR creation on the platform credential,
+// passed per call: GitHub installation tokens / the Gitea PAT)
+const github = giteaCfg ? createGiteaProvider(giteaCfg) : createGitHubProvider({ baseUrl: GH_BASE, apiUrl: GH_API });
 // authz = the app-side installation-token check (ADR 0001, no user token — the
 // only path since ADR 0007). none mode: everything the registry knows is writable.
 const access = NO_AUTH ? allowAllAccess : new AccessCache(connectionSource);
@@ -397,8 +421,8 @@ if (!NO_AUTH && (!oidc || !oidcLogin)) {
 if (!NO_AUTH && !connectionSource?.checkUserPermission) {
   throw refuseStart(
     new Error(
-      "LIVE_AUTH=oidc needs a GitHub App connection (GITHUB_APP_ID + private key, or a cell's token mint): " +
-        "per-repo authorization runs on installation tokens (ADR 0001) — an identity-only session can write nothing without it",
+      "LIVE_AUTH=oidc needs a platform connection (GITEA_URL + GITEA_TOKEN, or GITHUB_APP_ID + private key, or a cell's token mint): " +
+        "per-repo authorization runs on the platform credential (ADR 0001) — an identity-only session can write nothing without it",
     ),
   );
 }
@@ -447,7 +471,7 @@ const server = new Server({
 const httpServer = startApi(PORT, {
   webDist: WEB_DIST,
   publicUrl: PUBLIC_URL,
-  githubBaseUrl: GH_BASE,
+  githubBaseUrl: giteaCfg?.baseUrl ?? GH_BASE,
   wsTickets,
   loginCodes,
   // agent presence: MCP calls show up in the rooms they touch, for co-editors
